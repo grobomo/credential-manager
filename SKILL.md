@@ -49,7 +49,7 @@ Stores API tokens/secrets in the OS credential store instead of plaintext files.
 - **NEVER** write secrets to plaintext files, YAML, JSON, or scripts
 - **NEVER** put real credentials in kubectl commands, docker env flags, or shell variables
 - **ALWAYS** use this skill when ANY of these come up: API key, token, secret, JWT, password, bearer token, webhook secret, client secret, access key, private key
-- **ALWAYS** launch the GUI for storing new credentials -- never accept them as text input
+- **ALWAYS** use clipboard-based store for new credentials -- never accept them as text input
 - **ALWAYS** use `credential:` prefix in .env files for secret values
 - When generating k8s secrets, deploy scripts, or docker commands that need credentials: reference the credential store, never hardcode values
 
@@ -58,10 +58,10 @@ Stores API tokens/secrets in the OS credential store instead of plaintext files.
 When user needs to store a token/key/secret:
 
 1. Determine key name from context (e.g. "rdsec api key" -> `rdsec/API_KEY`)
-2. Launch GUI: `python ~/.claude/skills/credential-manager/store_gui.py KEY_NAME`
-3. If key name unclear, omit it -- GUI prompts for both name and value
+2. Tell user to copy the secret to their clipboard
+3. Run: `python ~/.claude/skills/credential-manager/store.py SERVICE/KEY`
 
-GUI pops up with masked field. User pastes, clicks Store. Memory zeroed after.
+Reads clipboard, validates content (rejects non-secrets), stores in keyring, clears clipboard, zeros memory.
 
 ## Retrieving Credentials (for scripts/deploys)
 
@@ -94,8 +94,10 @@ python ~/.claude/skills/credential-manager/kubectl_secret.py \
 All credential operations use `cred_cli.py` directly -- NOT super_manager.py.
 
 ```bash
-# Store (GUI popup)
-python ~/.claude/skills/credential-manager/store_gui.py SERVICE/KEY
+# Store (reads from clipboard — user copies secret first)
+python ~/.claude/skills/credential-manager/store.py SERVICE/KEY
+# or equivalently:
+python ~/.claude/skills/credential-manager/cred_cli.py store SERVICE/KEY
 
 # List stored (names only, with health status)
 python ~/.claude/skills/credential-manager/cred_cli.py list
@@ -156,12 +158,13 @@ Service name: `claude-code`. Key format: `SERVICE/VARIABLE`.
 
 ```
 ~/.claude/skills/credential-manager/
-├── cred_cli.py               # Standalone CLI (list, store, verify, audit, migrate, securify)
-├── store_gui.py              # Secure GUI for storing credentials
+├── store.py                  # Convenience entry point for storing credentials
+├── cred_cli.py               # Full CLI (store, list, verify, audit, migrate, securify, protect)
 ├── claude_cred.py            # Python resolver (credential: prefix)
 ├── claude-cred.js            # Node.js resolver
 ├── credential-registry.json  # Key name index (no secrets)
-└── setup.py                  # First-time setup + verification
+├── setup.py                  # First-time setup + verification
+└── archive/store_gui.py      # Archived GUI (replaced by clipboard workflow)
 ```
 
 Requires `keyring` Python package (auto-installed by setup.py).
@@ -169,3 +172,4 @@ Requires `keyring` Python package (auto-installed by setup.py).
 ## TODO
 
 - [x] Add `--clipboard` flag to `cred_cli.py store` (2026-03-10) -- reads from OS clipboard, stores, clears clipboard, zeros memory
+- [x] Make clipboard the default store method, remove GUI dependency (2026-04-05)

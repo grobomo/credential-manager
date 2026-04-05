@@ -2,11 +2,12 @@
 cred_cli.py - Standalone credential manager CLI.
 
 Self-contained -- works without super-manager. Uses OS keyring directly.
+Clipboard is the default (and only) method for storing credentials.
 All operations are logged to audit.log (never logs secret values).
 
 Usage:
+    python cred_cli.py store SERVICE/KEY       # reads from clipboard (default)
     python cred_cli.py list [SERVICE]
-    python cred_cli.py store SERVICE/KEY [--clipboard]
     python cred_cli.py delete SERVICE/KEY
     python cred_cli.py verify
     python cred_cli.py audit [PATH_TO_ENV]
@@ -18,8 +19,11 @@ import sys
 import os
 import re
 import json
+import gc
+import ctypes
 import datetime
 import platform
+import subprocess
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 REGISTRY_PATH = os.path.join(SKILL_DIR, "credential-registry.json")
@@ -55,7 +59,7 @@ def write_registry(creds):
 
 
 def now_iso():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def audit_log(action, key, detail="", caller=None):
@@ -113,19 +117,141 @@ def cmd_list(service_filter=None):
     audit_log("LIST", service_filter or "*")
 
 
-def cmd_store(key, clipboard=False):
+def _secure_zero(ba):
+    """Zero out a bytearray's memory (best-effort)."""
+    if ba and isinstance(ba, bytearray):
+        ctypes.memset((ctypes.c_char * len(ba)).from_buffer(ba), 0, len(ba))
+
+
+def _validate_secret(value, key):
+    """Check if a value looks like a real secret vs clipboard contamination.
+    Returns (ok, reason) tuple."""
+    if not value:
+        return False, "empty value"
+    if "\n" in value:
+        return False, "contains newlines -- likely clipboard contamination"
+    if len(value.split()) > 4:
+        return False, f"contains {len(value.split())} words -- likely clipboard contamination"
+    bad_starts = ["Resource", "Usage:", "Error", "No ", "WARNING", "INFO", "DEBUG",
+                  "Traceback", "  [", "node ", "python ", "bash ", "#!/", "import "]
+    for prefix in bad_starts:
+        if value.startswith(prefix):
+            return False, f"starts with '{prefix}' -- not a secret"
+    if len(value) < 4:
+        return False, f"only {len(value)} chars -- too short for a secret"
+    return True, "ok"
+
+
+def _read_clipboard():
+    """Read clipboard content using platform-appropriate method."""
+    if platform.system() == "Windows":
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    elif platform.system() == "Darwin":
+        result = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    else:
+        # Linux: try xclip, xsel
+        for cmd in [["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]]:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            except FileNotFoundError:
+                continue
+    return None
+
+
+def _clear_clipboard():
+    """Clear clipboard content after storing."""
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $null"],
+                capture_output=True, timeout=5
+            )
+        elif platform.system() == "Darwin":
+            subprocess.run(["pbcopy"], input="", text=True, timeout=5)
+        else:
+            for cmd in [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
+                try:
+                    subprocess.run(cmd, input="", text=True, timeout=5)
+                    break
+                except FileNotFoundError:
+                    continue
+    except Exception:
+        pass  # best-effort
+
+
+def cmd_store(key):
+    """Store a credential from the OS clipboard. Validates, stores, clears clipboard, zeros memory."""
     if "/" not in key:
         print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
         sys.exit(1)
-    gui_path = os.path.join(SKILL_DIR, "store_gui.py")
-    if os.path.exists(gui_path):
-        clip_flag = " --clipboard" if clipboard else ""
-        method = "clipboard" if clipboard else "gui"
-        audit_log("STORE", key, f"method={method}")
-        os.system(f'python "{gui_path}" "{key}"{clip_flag}')
-    else:
-        print(f"ERROR: store_gui.py not found at {gui_path}")
+
+    # Check protected keys
+    protected = _load_protected()
+    if key in protected:
+        existing = keyring.get_password(KEYRING_SERVICE, key)
+        if existing:
+            ok, _ = _validate_secret(existing, key)
+            if ok:
+                print(f"BLOCKED: {key} is protected and already has a valid value.")
+                print(f"To overwrite, first run: python cred_cli.py unprotect {key}")
+                sys.exit(1)
+
+    # Read clipboard
+    clip_value = _read_clipboard()
+    if not clip_value:
+        print("ERROR: clipboard is empty or inaccessible")
+        print("Copy the secret to your clipboard first, then run this command.")
         sys.exit(1)
+
+    # Validate
+    ok, reason = _validate_secret(clip_value, key)
+    if not ok:
+        print(f"REJECTED: clipboard content failed validation for {key}")
+        print(f"Reason: {reason}")
+        print(f"Clipboard preview: {clip_value[:50]}...")
+        audit_log("REJECT", key, f"method=clipboard reason={reason}")
+        sys.exit(1)
+
+    # Store in keyring
+    secret_buf = bytearray(clip_value.encode('utf-8'))
+    try:
+        keyring.set_password(KEYRING_SERVICE, key, secret_buf.decode('utf-8'))
+        audit_log("STORE", key, "method=clipboard")
+    except Exception as e:
+        print(f"ERROR: failed to store: {e}")
+        sys.exit(1)
+    finally:
+        _secure_zero(secret_buf)
+
+    # Clear clipboard
+    _clear_clipboard()
+
+    # Update registry
+    creds = read_registry()
+    service = key.split("/")[0]
+    variable = key.split("/", 1)[1]
+    existing = next((c for c in creds if c["key"] == key), None)
+    if existing:
+        existing["added"] = now_iso()
+    else:
+        creds.append({"key": key, "service": service, "variable": variable, "added": now_iso()})
+    write_registry(creds)
+
+    del secret_buf
+    gc.collect()
+
+    print(f"OK - {key} stored from clipboard (clipboard cleared)")
 
 
 def cmd_verify():
@@ -147,7 +273,7 @@ def cmd_verify():
             if "\n" in val:
                 problems.append("contains newlines (likely clipboard contamination)")
             if len(val) > 5 and val.strip().startswith(("{", "[", "<", "Resource", "Usage:", "Error", "No ")):
-                problems.append(f"looks like non-secret content: {val[:40]}...")
+                problems.append("looks like non-secret content (starts with structural/error text)")
             if any(p in key.upper() for p in ["SECRET", "TOKEN", "KEY", "PASSWORD"]):
                 if len(val) < 8:
                     problems.append(f"suspiciously short ({len(val)} chars)")
@@ -357,7 +483,7 @@ def cmd_protect(key):
     keys.append(key)
     _save_protected(keys)
     audit_log("PROTECT", key)
-    print(f"Protected: {key} (cannot be overwritten via --clipboard)")
+    print(f"Protected: {key} (cannot be overwritten via store)")
 
 
 def cmd_unprotect(key):
@@ -397,12 +523,13 @@ if __name__ == "__main__":
     if action == "list":
         cmd_list(args[0] if args else None)
     elif action == "store":
+        # Filter out legacy --clipboard flag (clipboard is now always the default)
         remaining = [a for a in args if a not in ("--clipboard", "--clip")]
-        clipboard = "--clipboard" in args or "--clip" in args
         if not remaining:
-            print("Usage: cred_cli.py store SERVICE/KEY [--clipboard]")
+            print("Usage: cred_cli.py store SERVICE/KEY")
+            print("Copy the secret to your clipboard first, then run this command.")
             sys.exit(1)
-        cmd_store(remaining[0], clipboard=clipboard)
+        cmd_store(remaining[0])
     elif action == "verify":
         cmd_verify()
     elif action == "audit":

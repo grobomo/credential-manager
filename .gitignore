@@ -4,3 +4,7 @@ archive/
 node_modules/
 build/
 dist/
+audit.log
+archived-credentials.jsonl
+credential-registry.json
+protected-keys.json

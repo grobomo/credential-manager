@@ -21,8 +21,8 @@ import datetime
 from pathlib import Path
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
-REGISTRY_PATH = os.path.join(SKILL_DIR, "credential-registry.json")
-KEYRING_SERVICE = "claude-code"
+sys.path.insert(0, SKILL_DIR)
+from cred_cli import read_registry, write_registry, KEYRING_SERVICE, REGISTRY_PATH
 
 SCAN_EXTENSIONS = {".py", ".js", ".ts", ".mjs", ".cjs", ".yaml", ".yml", ".env", ".json"}
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", "build"}
@@ -70,22 +70,6 @@ def is_real_secret_value(value):
         return True
     return False
 
-
-def read_registry():
-    try:
-        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("credentials", [])
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def write_registry(creds):
-    data = {"credentials": creds}
-    tmp = REGISTRY_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, REGISTRY_PATH)
 
 
 def store_credential(key, value, dry_run=False):
