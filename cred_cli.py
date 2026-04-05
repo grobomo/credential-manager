@@ -7,6 +7,7 @@ All operations are logged to audit.log (never logs secret values).
 
 Usage:
     python cred_cli.py store SERVICE/KEY [--force]  # reads from clipboard
+    python cred_cli.py store SERVICE/KEY --from-cmd "command"  # runs command, stores stdout
     python cred_cli.py list [SERVICE]
     python cred_cli.py delete SERVICE/KEY
     python cred_cli.py verify
@@ -192,8 +193,27 @@ def _clear_clipboard():
         pass  # best-effort
 
 
-def cmd_store(key, force=False):
-    """Store a credential from the OS clipboard. Validates, stores, clears clipboard, zeros memory."""
+def _run_cmd_capture(cmd_str):
+    """Run a shell command and capture stdout. Returns (value, error)."""
+    try:
+        result = subprocess.run(
+            cmd_str, shell=True, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            return None, f"command failed (exit {result.returncode}): {stderr or '(no stderr)'}"
+        value = result.stdout.strip()
+        if not value:
+            return None, "command produced no output"
+        return value, None
+    except subprocess.TimeoutExpired:
+        return None, "command timed out after 30 seconds"
+    except Exception as e:
+        return None, f"failed to run command: {e}"
+
+
+def cmd_store(key, force=False, from_cmd=None):
+    """Store a credential from clipboard or command output. Validates, stores, zeros memory."""
     if "/" not in key:
         print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
         sys.exit(1)
@@ -209,39 +229,48 @@ def cmd_store(key, force=False):
                 print(f"To overwrite, first run: python cred_cli.py unprotect {key}")
                 sys.exit(1)
 
-    # Read clipboard
-    clip_value = _read_clipboard()
-    if not clip_value:
-        print("ERROR: clipboard is empty or inaccessible")
-        print("Copy the secret to your clipboard first, then run this command.")
-        sys.exit(1)
+    # Get secret value from command or clipboard
+    if from_cmd:
+        method = "from-cmd"
+        secret_value, err = _run_cmd_capture(from_cmd)
+        if err:
+            print(f"ERROR: --from-cmd failed: {err}")
+            sys.exit(1)
+    else:
+        method = "clipboard"
+        secret_value = _read_clipboard()
+        if not secret_value:
+            print("ERROR: clipboard is empty or inaccessible")
+            print("Copy the secret to your clipboard first, then run this command.")
+            sys.exit(1)
 
     # Validate (skip with --force)
-    ok, reason = _validate_secret(clip_value, key)
+    ok, reason = _validate_secret(secret_value, key)
     if not ok and not force:
-        print(f"REJECTED: clipboard content failed validation for {key}")
+        print(f"REJECTED: value failed validation for {key}")
         print(f"Reason: {reason}")
-        print(f"Clipboard preview: {clip_value[:50]}...")
+        print(f"Preview: {secret_value[:50]}...")
         print("Use --force to store anyway.")
-        audit_log("REJECT", key, f"method=clipboard reason={reason}")
+        audit_log("REJECT", key, f"method={method} reason={reason}")
         sys.exit(1)
     if not ok and force:
         print(f"WARNING: validation failed ({reason}) but --force used, storing anyway.")
-        audit_log("STORE", key, f"method=clipboard forced=true reason={reason}")
+        audit_log("STORE", key, f"method={method} forced=true reason={reason}")
 
     # Store in keyring
-    secret_buf = bytearray(clip_value.encode('utf-8'))
+    secret_buf = bytearray(secret_value.encode('utf-8'))
     try:
         keyring.set_password(KEYRING_SERVICE, key, secret_buf.decode('utf-8'))
-        audit_log("STORE", key, "method=clipboard")
+        audit_log("STORE", key, f"method={method}")
     except Exception as e:
         print(f"ERROR: failed to store: {e}")
         sys.exit(1)
     finally:
         _secure_zero(secret_buf)
 
-    # Clear clipboard
-    _clear_clipboard()
+    # Clear clipboard only if we read from it
+    if not from_cmd:
+        _clear_clipboard()
 
     # Update registry
     creds = read_registry()
@@ -254,10 +283,13 @@ def cmd_store(key, force=False):
         creds.append({"key": key, "service": service, "variable": variable, "added": now_iso()})
     write_registry(creds)
 
+    # Zero the local variable too
+    secret_value = None
     del secret_buf
     gc.collect()
 
-    print(f"OK - {key} stored from clipboard (clipboard cleared)")
+    source = "command output" if from_cmd else "clipboard (clipboard cleared)"
+    print(f"OK - {key} stored from {source}")
 
 
 def cmd_verify():
@@ -554,8 +586,8 @@ def cmd_expire(key, days):
     print(f"Set expiry for {key}: {entry['expires']} ({days} days from now)")
 
 
-def cmd_rotate(key, force=False):
-    """Rotate a credential: store new value from clipboard, archive old value's metadata."""
+def cmd_rotate(key, force=False, from_cmd=None):
+    """Rotate a credential: store new value from clipboard or command, archive old value's metadata."""
     if "/" not in key:
         print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
         sys.exit(1)
@@ -575,8 +607,8 @@ def cmd_rotate(key, force=False):
     except Exception:
         pass
 
-    # Store new value from clipboard
-    cmd_store(key, force=force)
+    # Store new value
+    cmd_store(key, force=force, from_cmd=from_cmd)
     audit_log("ROTATE", key)
     print(f"Rotated: {key} (old value archived, new value stored)")
 
@@ -594,14 +626,24 @@ if __name__ == "__main__":
     if action == "list":
         cmd_list(args[0] if args else None)
     elif action == "store":
-        # Filter out legacy --clipboard flag (clipboard is now always the default)
         force = "--force" in args or "-f" in args
-        remaining = [a for a in args if a not in ("--clipboard", "--clip", "--force", "-f")]
-        if not remaining:
-            print("Usage: cred_cli.py store SERVICE/KEY [--force]")
-            print("Copy the secret to your clipboard first, then run this command.")
+        from_cmd = None
+        filtered = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--from-cmd" and i + 1 < len(args):
+                from_cmd = args[i + 1]
+                i += 2
+            elif args[i] in ("--clipboard", "--clip", "--force", "-f"):
+                i += 1
+            else:
+                filtered.append(args[i])
+                i += 1
+        if not filtered:
+            print("Usage: cred_cli.py store SERVICE/KEY [--force] [--from-cmd \"command\"]")
+            print("Copy the secret to your clipboard first, or use --from-cmd.")
             sys.exit(1)
-        cmd_store(remaining[0], force=force)
+        cmd_store(filtered[0], force=force, from_cmd=from_cmd)
     elif action == "verify":
         cmd_verify()
     elif action == "audit":
@@ -643,12 +685,23 @@ if __name__ == "__main__":
         cmd_expire(args[0], days)
     elif action == "rotate":
         force = "--force" in args or "-f" in args
-        remaining = [a for a in args if a not in ("--force", "-f")]
-        if not remaining:
-            print("Usage: cred_cli.py rotate SERVICE/KEY [--force]")
-            print("Copy the NEW secret to clipboard first.")
+        from_cmd = None
+        filtered = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--from-cmd" and i + 1 < len(args):
+                from_cmd = args[i + 1]
+                i += 2
+            elif args[i] in ("--force", "-f"):
+                i += 1
+            else:
+                filtered.append(args[i])
+                i += 1
+        if not filtered:
+            print("Usage: cred_cli.py rotate SERVICE/KEY [--force] [--from-cmd \"command\"]")
+            print("Copy the NEW secret to clipboard first, or use --from-cmd.")
             sys.exit(1)
-        cmd_rotate(remaining[0], force=force)
+        cmd_rotate(filtered[0], force=force, from_cmd=from_cmd)
     elif action == "securify":
         if not args:
             print("Usage: cred_cli.py securify DIRECTORY [--service NAME] [--dry-run]")

@@ -5,7 +5,7 @@
  *   const path = require('path');
  *   const os = require('os');
  *   const { resolve, loadEnvFile } = require(
- *     path.join(os.homedir(), '.claude/super-manager/credentials/claude-cred.js')
+ *     path.join(os.homedir(), '.claude/skills/credential-manager/claude-cred.js')
  *   );
  *   loadEnvFile(__dirname + '/.env');
  */
@@ -23,6 +23,10 @@ const SERVICE = 'claude-code';
  * @throws {Error} If credential not found
  */
 function resolve(key) {
+    // Validate key format to prevent command injection (must be service/variable)
+    if (!/^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(key)) {
+        throw new Error('Invalid credential key format: ' + key);
+    }
     try {
         // Shell out to Python keyring - only happens at startup, not per-request
         const cmd = `python -c "import keyring; v=keyring.get_password('${SERVICE}','${key}'); print(v if v else '')"`;

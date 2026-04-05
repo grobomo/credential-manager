@@ -8,3 +8,4 @@ audit.log
 archived-credentials.jsonl
 credential-registry.json
 protected-keys.json
+SESSION_STATE.md

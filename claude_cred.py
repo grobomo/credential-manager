@@ -3,7 +3,7 @@ claude_cred.py - Credential resolution for Claude Code MCP servers and skills.
 
 Usage (replaces manual .env loader):
     import sys, os
-    sys.path.insert(0, os.path.expanduser('~/.claude/super-manager/credentials'))
+    sys.path.insert(0, os.path.expanduser('~/.claude/skills/credential-manager'))
     from claude_cred import load_env
     load_env()
 

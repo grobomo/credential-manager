@@ -23,6 +23,13 @@ User copies token from RONE portal to clipboard first.
 - [x] T012: Added `expire` command + expiry checking in verify (warns <7 days, flags expired)
 - [x] T013: Added `rotate` command — archives rotation event, stores new from clipboard
 
-## Contaminated credentials found by verify
-- [ ] T014: Re-store paperclip/CLAUDE_CODE_OAUTH_TOKEN (contains newlines)
-- [ ] T015: Re-store NEURAL_PIPELINE/CLAUDE_TOKEN (contains newlines)
+## --from-cmd: pipe command output into keyring (completed 2026-04-05)
+- [x] T016: Add `--from-cmd "command"` flag to cmd_store — runs command, captures stdout, stores in keyring, zeros memory. Also works with rotate. E2E tested with echo.
+- [ ] T017: Fix contaminated creds by re-storing via `--from-cmd` (requires user to identify which creds are contaminated and provide the source command)
+- [x] T018: Update SKILL.md with --from-cmd usage docs
+
+## Code review hardening (2026-04-05)
+- [x] T019: Fix command injection in claude-cred.js resolve() — added key format validation regex
+- [x] T020: Fix stale import paths in claude_cred.py and claude-cred.js docstrings (super-manager -> skills)
+- [x] T021: Fix stale import path in SKILL.md Node.js example
+- [x] T022: Update store.py to forward --from-cmd and --force flags

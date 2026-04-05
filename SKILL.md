@@ -63,6 +63,17 @@ When user needs to store a token/key/secret:
 
 Reads clipboard, validates content (rejects non-secrets), stores in keyring, clears clipboard, zeros memory.
 
+### From command output (no clipboard needed)
+
+For programmatic sources where a command produces the secret on stdout:
+
+```bash
+python ~/.claude/skills/credential-manager/cred_cli.py store SERVICE/KEY --from-cmd "command-that-outputs-secret"
+```
+
+Runs the command, captures stdout, validates, stores in keyring, zeros memory. Clipboard is not touched.
+Use `--force` to bypass validation if the command output doesn't look like a typical secret.
+
 ## Retrieving Credentials (for scripts/deploys)
 
 When a script or deploy needs a stored credential:
@@ -98,6 +109,9 @@ All credential operations use `cred_cli.py` directly -- NOT super_manager.py.
 python ~/.claude/skills/credential-manager/store.py SERVICE/KEY
 # or equivalently:
 python ~/.claude/skills/credential-manager/cred_cli.py store SERVICE/KEY
+
+# Store from command output (no clipboard)
+python ~/.claude/skills/credential-manager/cred_cli.py store SERVICE/KEY --from-cmd "command"
 
 # List stored (names only, with health status)
 python ~/.claude/skills/credential-manager/cred_cli.py list
@@ -140,7 +154,7 @@ load_env()  # Resolves credential: prefixes from .env
 ### Node.js:
 ```javascript
 const { loadEnvFile } = require(
-  require('path').join(require('os').homedir(), '.claude/super-manager/credentials/claude-cred.js')
+  require('path').join(require('os').homedir(), '.claude/skills/credential-manager/claude-cred.js')
 );
 loadEnvFile(__dirname + '/.env');
 ```
