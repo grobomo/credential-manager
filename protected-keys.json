@@ -1,0 +1,11 @@
+{
+  "protected": [
+    "gpdh/APPLICATION_ID",
+    "gpdh/SECRET_KEY",
+    "gpdh/TENANT_ID",
+    "grobomo/GITHUB_TOKEN",
+    "msgraph/CLIENT_SECRET",
+    "v1-api/V1_API_KEY",
+    "v1-lite/V1_API_KEY"
+  ]
+}
