@@ -6,10 +6,12 @@ Clipboard is the default (and only) method for storing credentials.
 All operations are logged to audit.log (never logs secret values).
 
 Usage:
-    python cred_cli.py store SERVICE/KEY       # reads from clipboard (default)
+    python cred_cli.py store SERVICE/KEY [--force]  # reads from clipboard
     python cred_cli.py list [SERVICE]
     python cred_cli.py delete SERVICE/KEY
     python cred_cli.py verify
+    python cred_cli.py expire SERVICE/KEY DAYS
+    python cred_cli.py rotate SERVICE/KEY [--force]  # clipboard -> replace old
     python cred_cli.py audit [PATH_TO_ENV]
     python cred_cli.py migrate PATH_TO_ENV SERVICE
     python cred_cli.py log [KEY_FILTER]
@@ -190,7 +192,7 @@ def _clear_clipboard():
         pass  # best-effort
 
 
-def cmd_store(key):
+def cmd_store(key, force=False):
     """Store a credential from the OS clipboard. Validates, stores, clears clipboard, zeros memory."""
     if "/" not in key:
         print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
@@ -214,14 +216,18 @@ def cmd_store(key):
         print("Copy the secret to your clipboard first, then run this command.")
         sys.exit(1)
 
-    # Validate
+    # Validate (skip with --force)
     ok, reason = _validate_secret(clip_value, key)
-    if not ok:
+    if not ok and not force:
         print(f"REJECTED: clipboard content failed validation for {key}")
         print(f"Reason: {reason}")
         print(f"Clipboard preview: {clip_value[:50]}...")
+        print("Use --force to store anyway.")
         audit_log("REJECT", key, f"method=clipboard reason={reason}")
         sys.exit(1)
+    if not ok and force:
+        print(f"WARNING: validation failed ({reason}) but --force used, storing anyway.")
+        audit_log("STORE", key, f"method=clipboard forced=true reason={reason}")
 
     # Store in keyring
     secret_buf = bytearray(clip_value.encode('utf-8'))
@@ -260,6 +266,7 @@ def cmd_verify():
     issues = []
     warnings = []
 
+    expired = []
     for c in creds:
         key = c["key"]
         try:
@@ -267,6 +274,20 @@ def cmd_verify():
             if not val:
                 issues.append(f"  {key}: registered but not in OS keyring")
                 continue
+
+            # Expiry check
+            exp = c.get("expires")
+            if exp:
+                try:
+                    exp_dt = datetime.datetime.strptime(exp, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=datetime.timezone.utc)
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    if now_dt > exp_dt:
+                        expired.append(f"  {key}: EXPIRED on {exp}")
+                    elif (exp_dt - now_dt).days < 7:
+                        warnings.append(f"  {key}: expires in {(exp_dt - now_dt).days} days ({exp})")
+                except ValueError:
+                    pass
 
             # Content validation -- detect corrupted values
             problems = []
@@ -288,17 +309,21 @@ def cmd_verify():
             issues.append(f"  {key}: keyring error - {e}")
 
     print(f"Healthy: {len(healthy)}")
+    if expired:
+        print(f"Expired: {len(expired)}")
+        for e in expired:
+            print(e)
     if warnings:
-        print(f"Suspect: {len(warnings)} (possibly corrupted)")
+        print(f"Warnings: {len(warnings)}")
         for w in warnings:
             print(w)
     if issues:
         print(f"Missing: {len(issues)}")
         for i in issues:
             print(i)
-    if not issues and not warnings:
+    if not issues and not warnings and not expired:
         print("No issues found.")
-    audit_log("VERIFY", "*", f"healthy={len(healthy)} suspect={len(warnings)} issues={len(issues)}")
+    audit_log("VERIFY", "*", f"healthy={len(healthy)} expired={len(expired)} suspect={len(warnings)} issues={len(issues)}")
 
 
 def cmd_audit(env_path=None):
@@ -510,6 +535,52 @@ def cmd_list_protected():
         print(f"  {k}")
 
 
+def cmd_expire(key, days):
+    """Set expiry date for a credential (days from now)."""
+    if "/" not in key:
+        print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
+        sys.exit(1)
+
+    creds = read_registry()
+    entry = next((c for c in creds if c["key"] == key), None)
+    if not entry:
+        print(f"ERROR: {key} not found in registry")
+        sys.exit(1)
+
+    exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+    entry["expires"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_registry(creds)
+    audit_log("EXPIRE", key, f"days={days} expires={entry['expires']}")
+    print(f"Set expiry for {key}: {entry['expires']} ({days} days from now)")
+
+
+def cmd_rotate(key, force=False):
+    """Rotate a credential: store new value from clipboard, archive old value's metadata."""
+    if "/" not in key:
+        print(f"ERROR: key must be SERVICE/VARIABLE, got: {key}")
+        sys.exit(1)
+
+    # Check old value exists
+    old_val = keyring.get_password(KEYRING_SERVICE, key)
+    if not old_val:
+        print(f"No existing value for {key}. Use 'store' instead.")
+        sys.exit(1)
+
+    # Archive rotation event (never archive actual values)
+    try:
+        with open(ARCHIVE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "key": key, "action": "rotated", "timestamp": now_iso()
+            }) + "\n")
+    except Exception:
+        pass
+
+    # Store new value from clipboard
+    cmd_store(key, force=force)
+    audit_log("ROTATE", key)
+    print(f"Rotated: {key} (old value archived, new value stored)")
+
+
 # --- Main ---
 
 if __name__ == "__main__":
@@ -524,12 +595,13 @@ if __name__ == "__main__":
         cmd_list(args[0] if args else None)
     elif action == "store":
         # Filter out legacy --clipboard flag (clipboard is now always the default)
-        remaining = [a for a in args if a not in ("--clipboard", "--clip")]
+        force = "--force" in args or "-f" in args
+        remaining = [a for a in args if a not in ("--clipboard", "--clip", "--force", "-f")]
         if not remaining:
-            print("Usage: cred_cli.py store SERVICE/KEY")
+            print("Usage: cred_cli.py store SERVICE/KEY [--force]")
             print("Copy the secret to your clipboard first, then run this command.")
             sys.exit(1)
-        cmd_store(remaining[0])
+        cmd_store(remaining[0], force=force)
     elif action == "verify":
         cmd_verify()
     elif action == "audit":
@@ -559,6 +631,24 @@ if __name__ == "__main__":
         cmd_unprotect(args[0])
     elif action == "protected":
         cmd_list_protected()
+    elif action == "expire":
+        if len(args) < 2:
+            print("Usage: cred_cli.py expire SERVICE/KEY DAYS")
+            sys.exit(1)
+        try:
+            days = int(args[1])
+        except ValueError:
+            print(f"ERROR: DAYS must be an integer, got: {args[1]}")
+            sys.exit(1)
+        cmd_expire(args[0], days)
+    elif action == "rotate":
+        force = "--force" in args or "-f" in args
+        remaining = [a for a in args if a not in ("--force", "-f")]
+        if not remaining:
+            print("Usage: cred_cli.py rotate SERVICE/KEY [--force]")
+            print("Copy the NEW secret to clipboard first.")
+            sys.exit(1)
+        cmd_rotate(remaining[0], force=force)
     elif action == "securify":
         if not args:
             print("Usage: cred_cli.py securify DIRECTORY [--service NAME] [--dry-run]")
